@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 i (OCR補完・送金の重複解消・シート表示)"
+VERSION = "2026-10-08 j (海外送金依頼書の読み取り)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -335,11 +335,42 @@ def parse_remit(t: str, suppliers) -> dict | None:
             "supplier": supplier, "supplier_sure": sure, "invoices": inv}
 
 
-def read_docs(pdf: Path, suppliers=(), products=None) -> tuple[list[dict], list[dict]]:
-    """1つのPDFから、許可通知書と送金計算書を全ページ分読む。"""
+def is_request_text(t: str) -> bool:
+    return "海外送金依頼書" in t and "伝票No" in t
+
+
+def parse_request(t: str, suppliers) -> dict | None:
+    """楽楽精算の「海外送金依頼書」(1申請=1管理番号)。通貨・送金額・送金希望日・取引先・商品名を拾う。"""
+    import difflib
+    flat = re.sub(r"[ \u3000]+", " ", t)
+
+    def field(label, pat):
+        m = re.search(label + r"\s*" + pat, flat)
+        return m.group(1).strip() if m else None
+    cur = field("通貨種別", r"([A-Z]{3})")
+    amt = field("送金額", r"(\d[\d,]*(?:\.\d+)?)")
+    d = field("送金希望日", r"(\d{4}/\d{1,2}/\d{1,2})")
+    if not (cur and amt and d):
+        return None
+    name = field("取引先名", r"(.+?)\s+品種") or ""
+    product = field("品種・商品名", r"(\S+)") or ""
+    memo = field("備考", r"(.+?)(?:\n|↓|$)") or ""
+    supplier, sure, best = name, False, 0.0
+    for sname in suppliers:
+        r = difflib.SequenceMatcher(None, norm_name(name), norm_name(sname)).ratio()
+        if r > best and r >= 0.78:
+            best, supplier, sure = r, sname, True
+    return {"date": datetime(*map(int, d.split("/"))), "cur": cur, "amount": to_num(amt),
+            "supplier": supplier, "supplier_sure": sure, "product": product, "memo": memo,
+            "slip": field("伝票No\\.?", r"(\d+)")}
+
+
+def read_docs(pdf: Path, suppliers=(), products=None):
+    """1つのPDFから、許可通知書・送金計算書・海外送金依頼書を全ページ分読む。"""
     products = products if products is not None else DEFAULT_PRODUCTS
     permits: dict[str, dict] = {}
     remits: list[dict] = []
+    requests: list[dict] = []
     with pdfplumber.open(pdf) as doc:
         texts = [(p.extract_text(layout=True) or "") for p in doc.pages]
     for i, t in enumerate(texts):
@@ -349,6 +380,13 @@ def read_docs(pdf: Path, suppliers=(), products=None) -> tuple[list[dict], list[
                 continue
             items = ocr_items(pdf, i)
             t = "\n".join(x[2] for x in items)
+        if is_request_text(t):
+            q = parse_request(t, suppliers)
+            if q and not any(q["slip"] and q["slip"] == x["slip"] for x in requests):
+                m = re.search(r"[【\[]\s*(\d{2,3}-\d{3})\s*[】\]]", pdf.name)
+                q["no_hint"] = m.group(1) if m else None  # 依頼書のファイル名にある管理番号
+                requests.append(q)
+            continue
         if is_remit_text(t, pdf.name):
             r = parse_remit(t, suppliers)
             if r and not any((r["date"], r["cur"], r["amount"]) == (x["date"], x["cur"], x["amount"]) for x in remits):
@@ -375,9 +413,9 @@ def read_docs(pdf: Path, suppliers=(), products=None) -> tuple[list[dict], list[
             sure = False
         info["shipper_sure"] = sure
         out.append(info)
-    if not out and not remits:
-        raise ValueError("許可通知書・送金計算書が見つかりません")
-    return out, remits
+    if not out and not remits and not requests:
+        raise ValueError("許可通知書・送金計算書・海外送金依頼書が見つかりません")
+    return out, remits, requests
 
 
 def find_subsets(cands: list[dict], target: float, limit: int = 3) -> list[list[dict]]:
@@ -399,32 +437,69 @@ def find_subsets(cands: list[dict], target: float, limit: int = 3) -> list[list[
     return sols
 
 
-def build_groups(permits: list[dict], remits: list[dict], window: int = 150) -> list[dict]:
-    """送金ごとに、金額の合う許可通知書を結びつける。結びつかないものも残す。"""
+def match_permits(free: list[dict], cur: str, amount: float, supplier: str, supplier_sure: bool,
+                  date: datetime, window: int = 150):
+    """仕入書価格の合計が amount になる許可通知書の組み合わせ。(選んだもの, 候補が複数か)"""
+    cands = []
+    for p in free:
+        if p.get("inv_amt") is None or p.get("inv_cur") != cur:
+            continue
+        if p["permit"] and abs((p["permit"] - date).days) > window:
+            continue
+        if supplier_sure and p["shipper_sure"] and p["shipper"] and norm_name(p["shipper"]) != norm_name(supplier):
+            continue
+        cands.append(p)
+    cands.sort(key=lambda p: abs((p["permit"] - date).days) if p["permit"] else 9999)
+    sols = find_subsets(cands, amount)
+    chosen = sols[0] if sols else []
+    return chosen, len({tuple(sorted(id(x) for x in sol)) for sol in sols}) > 1
+
+
+def build_groups(permits: list[dict], remits: list[dict], requests: list[dict] = (), window: int = 150) -> list[dict]:
+    """管理番号の単位でまとめる。①海外送金依頼書(1申請=1番号) ②銀行の送金計算書 ③許可通知書だけ。
+    各グループの "rem" は、台帳に書く送金情報(日付・通貨・金額・レート・円貨額)。"""
     free = list(permits)
     groups = []
+    # 銀行の送金 ← 依頼書(合計が一致する組み合わせ。例: 9,800USD = 7,000 + 2,800)
+    bank_of: dict[int, dict] = {}
+    used_rem = set()
+    reqs = [dict(q, inv_amt=q["amount"], inv_cur=q["cur"], permit=q["date"], shipper=q["supplier"],
+                 shipper_sure=q["supplier_sure"], _orig=q) for q in requests]
     for rem in sorted(remits, key=lambda r: r["date"]):
-        cands = []
-        for p in free:
-            if p.get("inv_amt") is None or p.get("inv_cur") != rem["cur"]:
-                continue
-            if p["permit"] and abs((p["permit"] - rem["date"]).days) > window:
-                continue
-            if (rem["supplier_sure"] and p["shipper_sure"] and p["shipper"]
-                    and norm_name(p["shipper"]) != norm_name(rem["supplier"])):
-                continue
-            cands.append(p)
-        cands.sort(key=lambda p: abs((p["permit"] - rem["date"]).days) if p["permit"] else 9999)
+        cands = [q for q in reqs if q["cur"] == rem["cur"] and id(q["_orig"]) not in bank_of
+                 and abs((q["date"] - rem["date"]).days) <= 45
+                 and not (rem["supplier_sure"] and q["supplier_sure"] and norm_name(q["supplier"]) != norm_name(rem["supplier"]))]
+        cands.sort(key=lambda q: abs((q["date"] - rem["date"]).days))
         sols = find_subsets(cands, rem["amount"])
-        chosen = sols[0] if sols else []
-        ambiguous = len({tuple(sorted(id(x) for x in s)) for s in sols}) > 1
-        for p in chosen:
-            free.remove(p)
-        groups.append({"rem": rem, "items": chosen, "ambiguous": ambiguous})
-    groups.extend({"rem": None, "items": [p], "ambiguous": False} for p in free)
+        if sols:
+            used_rem.add(id(rem))
+            for q in sols[0]:
+                bank_of[id(q["_orig"])] = rem
+    for q in requests:
+        bank = bank_of.get(id(q))
+        date = bank["date"] if bank else q["date"]
+        chosen, amb = match_permits(free, q["cur"], q["amount"], q["supplier"], q["supplier_sure"], date, window)
+        for pm in chosen:
+            free.remove(pm)
+        rate = bank["rate"] if bank else None
+        yen = (round(q["amount"] * rate) if rate else None) if q["cur"] != "JPY" else int(round(q["amount"]))
+        pay = {"date": date, "cur": q["cur"], "amount": q["amount"], "rate": rate, "yen": yen,
+               "supplier": q["supplier"], "supplier_sure": q["supplier_sure"], "product": q["product"],
+               "est": bank is None, "slip": q["slip"]}
+        pay["no_hint"] = q.get("no_hint")
+        groups.append({"rem": pay, "items": chosen, "ambiguous": amb, "req": q})
+    # 依頼書に結びつかなかった送金計算書は、従来どおり許可通知書と直接結びつける
+    for rem in sorted(remits, key=lambda r: r["date"]):
+        if id(rem) in used_rem:
+            continue
+        chosen, amb = match_permits(free, rem["cur"], rem["amount"], rem["supplier"], rem["supplier_sure"], rem["date"], window)
+        for pm in chosen:
+            free.remove(pm)
+        groups.append({"rem": rem, "items": chosen, "ambiguous": amb})
+    groups.extend({"rem": None, "items": [pm], "ambiguous": False} for pm in free)
 
     def key(g):
-        ds = [g["rem"]["date"]] if g["rem"] else [p["permit"] for p in g["items"] if p["permit"]]
+        ds = [g["rem"]["date"]] if g["rem"] else [pm["permit"] for pm in g["items"] if pm["permit"]]
         return min(ds) if ds else datetime.max
     return sorted(groups, key=key)
 
@@ -434,9 +509,12 @@ def describe_groups(groups: list[dict]) -> None:
         rem, items = g["rem"], g["items"]
         if rem:
             amt = f"{rem['amount']:,.2f}" if rem["cur"] != "JPY" else f"{int(rem['amount']):,}"
-            print(f"■ 送金 {rem['date']:%Y/%m/%d}  {rem['cur']} {amt}  {rem['supplier'] or '(受取人不明)'}"
+            kind = ("依頼書(送金希望日・銀行の計算書なし)" if g.get("req") and rem.get("est")
+                    else "依頼書+銀行の送金" if g.get("req") else "送金")
+            print(f"■ {kind} {rem['date']:%Y/%m/%d}  {rem['cur']} {amt}  {rem['supplier'] or '(受取人不明)'}"
                   + (f"  → 許可通知書 {len(items)} 件" if items else "  → 金額の合う許可通知書が見つかりません(要確認)")
-                  + ("  ※合う組み合わせが複数あります(要確認)" if g["ambiguous"] else ""))
+                  + ("  ※合う組み合わせが複数あります(要確認)" if g["ambiguous"] else "")
+                  + (f"  管理番号(依頼書のファイル名) {rem['no_hint']}" if rem.get("no_hint") else ""))
         else:
             print("■ 送金計算書が見つかりません(送金の欄は空欄・黄色になります)")
         for p in sorted(items, key=lambda x: x['permit'] or datetime.max):
@@ -485,10 +563,12 @@ def new_ledger(path: Path, period: int):
     wb.save(path)
 
 
-def next_no(ws, col: int, prefix: str, period: int) -> str:
+def next_no(ws, col: int, prefix: str, period: int, reserved=()) -> str:
+    """続きの管理番号。依頼書のファイル名で予約された番号(reserved)も飛ばす。"""
     pat = re.compile(rf"^{re.escape(prefix)}{period}-(\d+)$")
     nums = [int(m.group(1)) for r in range(5 if ws.title == SHEET_SEND else 4, ws.max_row + 1)
             if (v := ws.cell(r, col).value) and (m := pat.match(str(v)))]
+    nums += [int(m.group(1)) for v in reserved if (m := pat.match(str(v)))]
     return f"{prefix}{period}-{max(nums, default=0) + 1:03d}"
 
 
@@ -605,10 +685,10 @@ def release_lock(path: Path) -> None:
 def run_all(a, root: Path, paths, confirm=None) -> int:
     """PDFを読み、送金ごとにまとめて表示し、(確認のうえ)台帳と表紙に保存する。保存した件数を返す。"""
     suppliers, products = load_suppliers(root), load_products(root)
-    permits, remits, skipped, seen, errors = [], [], 0, set(), []
+    permits, remits, requests, skipped, seen, errors = [], [], [], 0, set(), []
     for pdf in collect(paths):
         try:
-            ps, rs = read_docs(pdf, suppliers, products)
+            ps, rs, qs = read_docs(pdf, suppliers, products)
         except ValueError:
             skipped += 1  # 請求書・到着案内など、許可通知書・送金計算書ではないPDF
             continue
@@ -625,21 +705,26 @@ def run_all(a, root: Path, paths, confirm=None) -> int:
             if not any((r["date"], r["cur"], r["amount"]) == (x["date"], x["cur"], x["amount"]) for x in remits):
                 r["pdf"] = pdf
                 remits.append(r)
-    print(f"許可通知書 {len(permits)} 件、送金計算書 {len(remits)} 件を読み取りました"
+        for q in qs:
+            if not any(q["slip"] and q["slip"] == x["slip"] for x in requests):
+                q["pdf"] = pdf
+                requests.append(q)
+    print(f"許可通知書 {len(permits)} 件、送金計算書 {len(remits)} 件、海外送金依頼書 {len(requests)} 件を読み取りました"
           f"(それ以外のPDF {skipped} 件はスキップ)\n")
     if errors:
         print(f"※読み取りに失敗したPDFが {len(errors)} 件あります(詳細は {root / '実行ログ.txt'}):")
         for e in errors[:10]:
             print("   ", e)
         print()
-    if not permits and not remits:
+    if not permits and not remits and not requests:
         return 0
     if a.nosend:
         groups = [{"rem": None, "items": [p], "ambiguous": False}
                   for p in sorted(permits, key=lambda x: x["permit"] or datetime.max)]
     else:
-        groups = build_groups(permits, remits)
+        groups = build_groups(permits, remits, requests)
     describe_groups(groups)
+    a.reserved = {g["rem"]["no_hint"] for g in groups if g["rem"] and g["rem"].get("no_hint")}
     if a.dry_run:
         return len(groups)
     if confirm and not confirm(len(groups)):
@@ -872,7 +957,12 @@ def save_group(a, root: Path, g: dict) -> int:
         if fallback:
             used = {str(ws.cell(r, 3).value) for r in range(5, ws.max_row + 1)}
             shared = fmap.get(fkey) if fmap.get(fkey) in used else find_shared_no(ws, False, items[0])
-        no = shared or next_no(ws, 3, "", period)
+        hint = (rem or {}).get("no_hint")
+        taken = {str(ws.cell(r, 3).value) for r in range(5, ws.max_row + 1)}
+        if hint and hint.startswith(f"{period}-") and hint not in taken:
+            no = hint  # 依頼書のファイル名にある管理番号(まだ台帳で使われていない場合)
+        else:
+            no = shared or next_no(ws, 3, "", period, getattr(a, "reserved", ()))
     if len(nos) > 1:
         print(f"      管理番号 {', '.join(nos)} を {no} にまとめました")
 
@@ -910,7 +1000,7 @@ def save_group(a, root: Path, g: dict) -> int:
         put(row, 4, (p["shipper"] if p else rem["supplier"]) or None)
         if p:
             put(row, 14, p["shipper"])
-            put(row, 5, p["product"])
+            put(row, 5, p["product"] or (rem or {}).get("product"))
             put(row, 9, p["qty"])
             put(row, 10, p["unit"])
             put(row, 13, p["decl"])
@@ -931,6 +1021,8 @@ def save_group(a, root: Path, g: dict) -> int:
             warn += [4]
         if ambiguous:
             warn += [3]
+        if rem and rem.get("est"):
+            warn += [6]  # 送金日が依頼書の「送金希望日」(銀行の計算書で確認できていない)
         for c in warn:
             ws.cell(row, c).fill = HILITE
     wb.save(ledger)
