@@ -56,11 +56,14 @@ def desktop() -> Path:
 # ---------- PDF 読み取り ----------
 _ocr_engine = None
 DATE_RE = re.compile(r"(20\d{2})[/年.-](\d{1,2})[/月.-](\d{1,2})")
-DECL_RE = re.compile(r"(?<!\d)(\d{3})[ \u3000]?(\d{4})[ \u3000]?(\d{4})(?!\d)")
+SPACED_DECL = re.compile(r"(?<!\d)(\d{3}) (\d{4}) (\d{4})(?!\d)")
+PLAIN_DECL = re.compile(r"(?<!\d)(\d{3})(\d{4})(\d{4})(?!\d)")
+COMPANY = re.compile(r"[A-Za-z][A-Za-z0-9 .,&()'/-]{3,}(?:CO|LTD|LIMITED|INC|CORP|GMBH|LLC|PTE|S\.A)[A-Za-z0-9 .,&()'/-]*")
+OCR_MAX_PAGES = 10
 
 
-def ocr_items(pdf: Path):
-    """スキャン PDF を OCR し、[(y, x, text)] を上から下の順で返す(1ページ目のみ)。"""
+def ocr_items(pdf: Path, page_no: int):
+    """スキャンPDFの指定ページを OCR し、[(y比率, x, text)] を返す。"""
     global _ocr_engine
     try:
         import pypdfium2 as pdfium
@@ -69,8 +72,7 @@ def ocr_items(pdf: Path):
         raise ValueError("スキャンPDFの読み取りには `pip install rapidocr-onnxruntime pypdfium2` が必要です")
     if _ocr_engine is None:
         _ocr_engine = RapidOCR()
-    page = pdfium.PdfDocument(str(pdf))[0]
-    img = page.render(scale=3).to_numpy()
+    img = pdfium.PdfDocument(str(pdf))[page_no].render(scale=3).to_numpy()
     res, _ = _ocr_engine(img)
     h = img.shape[0]
     return [(b[0][1] / h, b[0][0], t) for b, t, _ in (res or [])]
@@ -80,7 +82,7 @@ def norm_name(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", s.upper().replace("LID", "LTD"))
 
 
-def match_supplier(raw: str, suppliers: list[str]) -> tuple[str, bool]:
+def match_supplier(raw: str, suppliers) -> tuple[str, bool]:
     """OCRの崩れた仕出人名を既知の仕入先名に寄せる。(名前, 確実か) を返す。"""
     import difflib
     key = norm_name(raw)
@@ -92,59 +94,97 @@ def match_supplier(raw: str, suppliers: list[str]) -> tuple[str, bool]:
     return (best, True) if score >= 0.85 else (raw, False)
 
 
-def parse_items(items):
-    """items: [(y比率, x, text)]。ラベルが誤認識されても数字・位置で拾う。"""
-    items = sorted(items)
-    alltext = "\n".join(t for _, _, t in items)
-    head = [t for y, _, t in items if y < 0.2]
-    decl = next((" ".join(m.groups()) for t in head if (m := DECL_RE.search(t))), None)
+def find_known_supplier(text: str, suppliers) -> str | None:
+    """ページ全体に既知の仕入先名が(表記ゆれ込みで)含まれていればその名前。"""
+    flat = norm_name(text)
+    hits = [n for n in suppliers if len(norm_name(n)) >= 8 and norm_name(n) in flat]
+    return max(hits, key=len) if hits else None
+
+
+def pick_date(text: str, labels=("輸入許可日", "審査終了日")):
+    for lab in labels:
+        m = re.search(lab + r"[\s\\|:：]*" + DATE_RE.pattern, text)
+        if m:
+            return datetime(*map(int, m.groups()))
+    return None
+
+
+def parse_page_text(text: str, suppliers) -> dict | None:
+    """文字情報のあるページ1枚分。許可通知書でなければ None。"""
+    if not re.search(r"輸入許可|SEA/IMP|AIR/IMP", text):
+        return None
+    flat = re.sub(r"[ \u3000]+", " ", text)
+    m = SPACED_DECL.search(flat)
+    if not m:  # 「輸入申告番号等」の11桁
+        m = re.search(r"輸入申告番号等\s*" + PLAIN_DECL.pattern, flat)
+    decl = " ".join(m.groups()) if m else None
     if not decl:
-        # 下部の「輸入申告番号等 11桁」
-        m = re.search(r"(?<!\d)(\d{3})(\d{4})(\d{4})(?!\d)", alltext)
-        decl = " ".join(m.groups()) if m else None
-    # 許可日: ページ下部(8割より下)の最初の日付 → なければ上部の申告年月日
+        return None
+    permit = pick_date(flat)
+    if not permit and (d := DATE_RE.search(flat)):
+        permit = datetime(*map(int, d.groups()))
+    shipper = ""
+    m = re.search(r"仕\s*出\s*人[^A-Za-z]{0,40}(" + COMPANY.pattern + ")", flat)
+    if m:
+        shipper = m.group(1).strip(" -.,")
+    return {"decl": decl, "permit": permit, "shipper": shipper}
+
+
+def parse_items(items, suppliers) -> dict | None:
+    """OCR結果(1ページ)。ラベルが誤認識されても数字・位置で拾う。"""
+    items = sorted(items)
+    head = [t for y, _, t in items if y < 0.2]
+    decl = next((" ".join(m.groups()) for t in head if (m := SPACED_DECL.search(t))), None)
+    if not decl:
+        return None  # 許可通知書の見出しがないページ(納付通知など)は対象外
     permit = None
-    for lo in (0.8, 0.0):
+    for lo in (0.8, 0.0):  # 下部の輸入許可日 → なければ上部の申告年月日
         for y, _, t in items:
             if y >= lo and (m := DATE_RE.search(t)):
                 permit = datetime(*map(int, m.groups()))
                 break
         if permit:
             break
-    # 仕出人: 「出人」を含むラベルの右隣(同じ高さ)の文字列
     shipper = ""
-    for y, x, t in items:
+    for y, x, t in items:  # 「出人」ラベルの右隣
         if re.search(r"仕\s*出\s*人|出\s*人$", t) and len(t) <= 6:
             cand = [(xx, tt) for yy, xx, tt in items if abs(yy - y) < 0.012 and xx > x + 50 and re.search(r"[A-Za-z]{3}", tt)]
             if cand:
                 shipper = min(cand)[1]
                 break
-    return decl, permit, shipper
+    return {"decl": decl, "permit": permit, "shipper": shipper}
 
 
-def read_permit(pdf: Path, suppliers: list[str] = ()) -> dict:
+def read_permits(pdf: Path, suppliers=()) -> list[dict]:
+    """1つのPDFから許可通知書を全ページ分読む(複数申告・納付通知付きにも対応)。"""
+    found: dict[str, dict] = {}
     with pdfplumber.open(pdf) as doc:
-        text = "\n".join((p.extract_text(layout=True) or "") for p in doc.pages)
-    decl = permit = None
-    shipper = ""
-    if text.strip():  # 文字情報あり
-        flat = re.sub(r"[ \u3000]+", " ", text)
-        m = re.search(r"申告番号\s*\n?[^\d]*?(\d{3})\s?(\d{4})\s?(\d{4})", flat) or DECL_RE.search(flat)
-        decl = " ".join(m.groups()) if m else None
-        m = re.search(r"輸入許可日\s*(\d{4})[/年.-](\d{1,2})[/月.-](\d{1,2})", flat)
-        permit = datetime(*map(int, m.groups())) if m else None
-        m = re.search(r"仕\s*出\s*人\s*[-ー－]?\s*([^\n]+)", text)
-        if m:
-            shipper = re.sub(r"\s{2,}.*$", "", m.group(1)).strip(" -")
-    if not (decl and permit and shipper):  # 足りなければ OCR で補う
-        d2, p2, s2 = parse_items(ocr_items(pdf))
-        decl, permit, shipper = decl or d2, permit or p2, shipper or s2
-    if not decl:
-        raise ValueError("申告番号(11桁)が見つかりません。輸入許可通知書ではない可能性があります")
-    sure = True
-    if shipper and suppliers:
-        shipper, sure = match_supplier(shipper, suppliers)
-    return {"decl": decl, "permit": permit, "shipper": shipper, "shipper_sure": sure}
+        texts = [(p.extract_text(layout=True) or "") for p in doc.pages]
+    for i, t in enumerate(texts):
+        info = parse_page_text(t, suppliers) if t.strip() else None
+        if info is None and not t.strip() and i < OCR_MAX_PAGES:  # 文字なしページは OCR
+            items = ocr_items(pdf, i)
+            info = parse_items(items, suppliers)
+            t = "\n".join(x[2] for x in items)
+        if info is None:
+            continue
+        if not info["shipper"] or not find_known_supplier(info["shipper"], suppliers):
+            known = find_known_supplier(t, suppliers)
+            if known:
+                info["shipper"] = known
+        found.setdefault(info["decl"], info)
+    out = []
+    for info in found.values():
+        sure = True
+        if info["shipper"] and suppliers:
+            info["shipper"], sure = match_supplier(info["shipper"], suppliers)
+        elif not info["shipper"]:
+            sure = False
+        info["shipper_sure"] = sure
+        out.append(info)
+    if not out:
+        raise ValueError("許可通知書(申告番号)が見つかりません。別の書類か、読み取れない画像の可能性があります")
+    return out
 
 
 def load_suppliers(root: Path) -> list[str]:
@@ -246,6 +286,7 @@ def main():
     ap.add_argument("--office", default="", help="事業所名/担当(例: 林六／東京)")
     ap.add_argument("--nosend", choices=["着払", "無償", "乙仲"], help="海外送金なしの場合の種別")
     ap.add_argument("--period", type=int, help="期(省略時は今日の日付から判定)")
+    ap.add_argument("--dry-run", action="store_true", help="読み取り結果を表示するだけで保存しない(検証用)")
     ap.add_argument("--out", type=Path, help="出力先(省略時はデスクトップ/輸入事後調査)")
     a = ap.parse_args()
 
@@ -254,43 +295,52 @@ def main():
     suppliers = load_suppliers(root)
     for pdf in collect(a.pdf):
         try:
-            info = read_permit(pdf, suppliers)
+            infos = read_permits(pdf, suppliers)
         except Exception as e:
             print(f"[NG] {pdf.name}: {e}", file=sys.stderr)
             continue
-        period = a.period or fiscal_period(datetime.now())  # 期は処理日基準(許可日が前期のこともある)
-        folder = root / f"第{period}期"
-        (folder / "表紙").mkdir(parents=True, exist_ok=True)
-        ledger = folder / f"輸入明細一覧_{period}期.xlsx"
-        if not ledger.exists():
-            new_ledger(ledger, period)
-        wb = openpyxl.load_workbook(ledger)
-        if a.nosend:
-            ws, prefix = wb[SHEET_NOSEND], "経"
-            no = next_no(ws, 2, prefix, period)
-            row = add_nosend(ws, no, a.office, info)
-        else:
-            ws = wb[SHEET_SEND]
-            no = next_no(ws, 3, "", period)
-            row = add_send(ws, no, a.office, info)
-        # 同じ申告番号の重複登録を防ぐ
-        col = 9 if a.nosend else 13
-        dup = [r for r in range(4, ws.max_row + 1)
-               if r != row and str(ws.cell(r, col).value or "").replace(" ", "") == info["decl"].replace(" ", "")]
-        if dup:
-            print(f"[SKIP] {pdf.name}: 申告番号 {info['decl']} は台帳の {dup[0]} 行目に登録済み", file=sys.stderr)
-            continue
-        if not info["shipper_sure"]:
-            for c in ((row, 3), (row, 10)) if a.nosend else ((row, 4), (row, 14)):
-                ws.cell(*c).fill = HILITE
-            print(f"      仕出人『{info['shipper']}』は照合できませんでした(黄色の欄を要確認)")
-        wb.save(ledger)
-        make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, info, a.nosend)
-        ok += 1
-        print(f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  許可日 {info['permit']:%Y/%m/%d}" if info["permit"]
-              else f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  (許可日は手入力)")
-    print(f"{ok} 件を {root} に保存しました")
+        for info in infos:
+            ok += process(a, root, pdf, info)
+    print(f"{ok} 件を確認しました(保存なし)" if a.dry_run else f"{ok} 件を {root} に保存しました")
     return 0 if ok else 1
+
+
+def process(a, root: Path, pdf: Path, info: dict) -> int:
+    """許可通知書1件分を台帳に追記し、表紙を作る。成功なら 1。"""
+    if a.dry_run:
+        d = f"{info['permit']:%Y/%m/%d}" if info["permit"] else "(許可日なし)"
+        flag = "" if info["shipper_sure"] else "  ※仕出人要確認"
+        print(f"[確認] {pdf.name}: 申告番号 {info['decl']}  許可日 {d}  仕出人 {info['shipper']}{flag}")
+        return 1
+    period = a.period or fiscal_period(datetime.now())  # 期は処理日基準(許可日が前期のこともある)
+    folder = root / f"第{period}期"
+    (folder / "表紙").mkdir(parents=True, exist_ok=True)
+    ledger = folder / f"輸入明細一覧_{period}期.xlsx"
+    if not ledger.exists():
+        new_ledger(ledger, period)
+    wb = openpyxl.load_workbook(ledger)
+    ws = wb[SHEET_NOSEND] if a.nosend else wb[SHEET_SEND]
+    col = 9 if a.nosend else 13
+    want = info["decl"].replace(" ", "")
+    dup = [r for r in range(4, ws.max_row + 1) if str(ws.cell(r, col).value or "").replace(" ", "") == want]
+    if dup:  # 同じ申告番号の二重登録を防ぐ
+        print(f"[SKIP] {pdf.name}: 申告番号 {info['decl']} は台帳の {dup[0]} 行目に登録済み", file=sys.stderr)
+        return 0
+    if a.nosend:
+        no = next_no(ws, 2, "経", period)
+        row = add_nosend(ws, no, a.office, info)
+    else:
+        no = next_no(ws, 3, "", period)
+        row = add_send(ws, no, a.office, info)
+    if not info["shipper_sure"]:
+        for c in ((row, 3), (row, 10)) if a.nosend else ((row, 4), (row, 14)):
+            ws.cell(*c).fill = HILITE
+        print(f"      仕出人『{info['shipper']}』は照合できませんでした(黄色の欄を要確認)")
+    wb.save(ledger)
+    make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, info, a.nosend)
+    d = f"{info['permit']:%Y/%m/%d}" if info["permit"] else "(許可日は手入力)"
+    print(f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  許可日 {d}")
+    return 1
 
 
 if __name__ == "__main__":
