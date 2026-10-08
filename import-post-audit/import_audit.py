@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 q (月の選択画面を親ウィンドウで表示)"
+VERSION = "2026-10-08 r (月のフォルダを選んでも月の一覧を出す)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -787,7 +787,7 @@ def detect_months(src: str, max_depth: int = 3) -> list[tuple[int, int]]:
     return sorted(found)
 
 
-def choose_months(root_win, months):
+def choose_months(root_win, months, preselect=None):
     """処理する月を、チェックボックスで選ぶ。キャンセルは None。
     (非表示の親ウィンドウに子ウィンドウを付けると表示されない環境があるため、親そのものを表示して使う)"""
     import tkinter as tk
@@ -802,7 +802,7 @@ def choose_months(root_win, months):
     grid.pack()
     vars_ = {}
     for i, ym in enumerate(months):
-        v = tk.BooleanVar(value=True)
+        v = tk.BooleanVar(value=(ym in preselect) if preselect else True)
         tk.Checkbutton(grid, text=f"{ym[0]}年{ym[1]}月", variable=v).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=3)
         vars_[ym] = v
     result = {"ok": False}
@@ -943,11 +943,21 @@ def gui() -> int:
             messagebox.showerror("入力エラー", "「着払」「無償」「乙仲」のどれかを入力してください")
             return 1
     months = None
+    preselect = None
     found_months = detect_months(src, 4)
+    if not found_months:  # 「2026年4月」のフォルダそのものを選んだ場合は、ひとつ上の階層から月の一覧を出す
+        m = re.search(r"(\d{4})年\s*(\d{1,2})月", Path(src).name)
+        parent = str(Path(src).parent)
+        if m and detect_months(parent, 2):
+            preselect = {(int(m.group(1)), int(m.group(2)))}
+            picked = Path(src).name
+            src, found_months = parent, detect_months(parent, 4)
+            print(f"選んだフォルダは月のフォルダ「{picked}」でした。ひとつ上の「{Path(src).name}」から月の一覧を出します"
+                  "(選んだ月にだけチェックが入ります)。")
     print("フォルダの中で見つかった月: " + ("、".join(f"{y}年{m}月" for y, m in found_months) if found_months else "なし"))
     if found_months:
         try:
-            months = choose_months(root_win, found_months)
+            months = choose_months(root_win, found_months, preselect)
             if months is None:
                 return 1  # キャンセル
         except Exception as e:  # 画面が出せない環境では、文字入力で代用する
