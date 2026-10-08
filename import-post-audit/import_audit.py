@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 f (送金計算書の読み取り・送金ごとの管理番号)"
+VERSION = "2026-10-08 g (送金計算書の読み取り・エラー表示・台帳を自動で開く)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -519,15 +519,52 @@ def collect(paths):
 SETTINGS = Path(__file__).resolve().parent / "settings.json"
 
 
+def log_error(root: Path, title: str) -> None:
+    import traceback
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / "実行ログ.txt", "a", encoding="utf8") as f:
+            f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {title}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+
+
+def acquire_lock(root: Path):
+    """同時に2つ動かして台帳が壊れるのを防ぐ。"""
+    import os
+    import time
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ".実行中"
+    if path.exists() and time.time() - path.stat().st_mtime > 1800:  # 30分以上前の残りは無効
+        path.unlink()
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        raise SystemExit("別の実行がまだ動いています。黒い画面が残っていないか確認して、終わってからやり直してください。"
+                         f"\n(動いていないのに出る場合は、{path} を削除してください)")
+    return path
+
+
+def release_lock(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def run_all(a, root: Path, paths, confirm=None) -> int:
     """PDFを読み、送金ごとにまとめて表示し、(確認のうえ)台帳と表紙に保存する。保存した件数を返す。"""
     suppliers, products = load_suppliers(root), load_products(root)
-    permits, remits, skipped, seen = [], [], 0, set()
+    permits, remits, skipped, seen, errors = [], [], 0, set(), []
     for pdf in collect(paths):
         try:
             ps, rs = read_docs(pdf, suppliers, products)
-        except Exception:
-            skipped += 1  # 請求書・到着案内など、対象外のPDF
+        except ValueError:
+            skipped += 1  # 請求書・到着案内など、許可通知書・送金計算書ではないPDF
+            continue
+        except Exception as e:  # 想定外の失敗は隠さず、ログに残す
+            errors.append(f"{pdf.name}: {type(e).__name__}: {e}")
+            log_error(root, f"読み取りエラー {pdf}")
             continue
         for p in ps:
             if p["decl"] not in seen:
@@ -539,6 +576,11 @@ def run_all(a, root: Path, paths, confirm=None) -> int:
             remits.append(r)
     print(f"許可通知書 {len(permits)} 件、送金計算書 {len(remits)} 件を読み取りました"
           f"(それ以外のPDF {skipped} 件はスキップ)\n")
+    if errors:
+        print(f"※読み取りに失敗したPDFが {len(errors)} 件あります(詳細は {root / '実行ログ.txt'}):")
+        for e in errors[:10]:
+            print("   ", e)
+        print()
     if not permits and not remits:
         return 0
     if a.nosend:
@@ -551,7 +593,14 @@ def run_all(a, root: Path, paths, confirm=None) -> int:
         return len(groups)
     if confirm and not confirm(len(groups)):
         return 0
-    return sum(save_group(a, root, g) for g in groups)
+    lock = acquire_lock(root)
+    try:
+        n = sum(save_group(a, root, g) for g in groups)
+    except PermissionError as e:
+        raise SystemExit(f"\n保存できません: {e.filename}\n台帳や表紙を Excel で開いている場合は、閉じてからもう一度実行してください。")
+    finally:
+        release_lock(lock)
+    return n
 
 
 def gui() -> int:
@@ -609,15 +658,29 @@ def gui() -> int:
     def confirm(n):
         return messagebox.askyesno("保存の確認", f"{n} 件の送金・許可通知書を、台帳と表紙に保存しますか?\n\n"
                                    "黒い画面の内容を確認してください。\n黄色になる欄は、保存後に台帳で確認してください。")
-    n = run_all(a, out, [src], confirm)
-    if not n:
-        messagebox.showinfo("結果", "保存したものはありません")
-        return 1
-    messagebox.showinfo("完了", f"{n} 件を保存しました。\n\n{out}")
     try:
-        os.startfile(out)
+        n = run_all(a, out, [src], confirm)
+    except SystemExit as e:
+        print(e)
+        messagebox.showerror("保存できませんでした", str(e))
+        return 1
     except Exception:
-        pass
+        import traceback
+        print(traceback.format_exc())
+        log_error(out, "実行中のエラー")
+        messagebox.showerror("エラー", f"途中で失敗しました。\n黒い画面の内容と、{out}\\実行ログ.txt を確認してください。")
+        return 1
+    if not n:
+        messagebox.showinfo("結果", "保存したものはありません。\n黒い画面の内容(件数・エラー)を確認してください。")
+        return 1
+    period = fiscal_period(datetime.now())
+    ledger = out / f"第{period}期" / f"輸入明細一覧_{period}期.xlsx"
+    messagebox.showinfo("完了", f"{n} 件を保存しました。\n\n{ledger}\n\nExcel(台帳)を開きます。")
+    for target in (ledger, out):
+        try:
+            os.startfile(target)
+        except Exception:
+            pass
     return 0
 
 
