@@ -29,10 +29,14 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 j (海外送金依頼書の読み取り)"
+VERSION = "2026-10-08 k (金額は読まない・表紙に申告番号を全件並べる)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
+
+# 金額(送金額・仕入金額・単価・表紙の金額)と、送金計算書・海外送金依頼書の読み取りは使わない。
+# True にすると、送金書類から金額まで読み取って結びつける機能が有効になる。
+READ_AMOUNTS = False
 
 # 同じ月(輸入許可日の年月)に複数あっても、管理番号を1つにまとめる仕出人
 MERGE_MONTHLY = ["TAEKWANG INDUSTRIAL CO.,LTD."]
@@ -380,14 +384,14 @@ def read_docs(pdf: Path, suppliers=(), products=None):
                 continue
             items = ocr_items(pdf, i)
             t = "\n".join(x[2] for x in items)
-        if is_request_text(t):
+        if READ_AMOUNTS and is_request_text(t):
             q = parse_request(t, suppliers)
             if q and not any(q["slip"] and q["slip"] == x["slip"] for x in requests):
                 m = re.search(r"[【\[]\s*(\d{2,3}-\d{3})\s*[】\]]", pdf.name)
                 q["no_hint"] = m.group(1) if m else None  # 依頼書のファイル名にある管理番号
                 requests.append(q)
             continue
-        if is_remit_text(t, pdf.name):
+        if READ_AMOUNTS and is_remit_text(t, pdf.name):
             r = parse_remit(t, suppliers)
             if r and not any((r["date"], r["cur"], r["amount"]) == (x["date"], x["cur"], x["amount"]) for x in remits):
                 remits.append(r)
@@ -515,13 +519,12 @@ def describe_groups(groups: list[dict]) -> None:
                   + (f"  → 許可通知書 {len(items)} 件" if items else "  → 金額の合う許可通知書が見つかりません(要確認)")
                   + ("  ※合う組み合わせが複数あります(要確認)" if g["ambiguous"] else "")
                   + (f"  管理番号(依頼書のファイル名) {rem['no_hint']}" if rem.get("no_hint") else ""))
-        else:
+        elif READ_AMOUNTS:
             print("■ 送金計算書が見つかりません(送金の欄は空欄・黄色になります)")
         for p in sorted(items, key=lambda x: x['permit'] or datetime.max):
             d = f"{p['permit']:%Y/%m/%d}" if p["permit"] else "(許可日なし)"
-            a_ = f"{p['inv_cur']} {p['inv_amt']:,.2f}".rstrip("0").rstrip(".") if p.get("inv_amt") is not None else "金額不明"
             flag = "" if p["shipper_sure"] else "  ※仕出人要確認"
-            print(f"    申告番号 {p['decl']}  許可日 {d}  {a_}  数量 {p['qty'] or '不明'}  {p['shipper']}{flag}")
+            print(f"    申告番号 {p['decl']}  許可日 {d}  数量 {p['qty'] or '不明'}  {p['product'] or ''}  {p['shipper']}{flag}")
     print()
 
 
@@ -612,7 +615,26 @@ def add_nosend(ws, no, office, info):
 
 
 # ---------- 表紙 ----------
+def cover_data(ws, no: str, nosend: bool) -> dict:
+    """台帳から、同じ管理番号の申告番号(全件)・許可日(最も早い日)・仕出人を集める。"""
+    c_no, c_decl, c_date, c_ship = (2, 9, 11, 10) if nosend else (3, 13, 15, 14)
+    decls, dates, shipper = [], [], ""
+    for r in range(4 if nosend else 5, ws.max_row + 1):  # 送金ありシートの4行目は「例」
+        if str(ws.cell(r, c_no).value or "") != no:
+            continue
+        d = str(ws.cell(r, c_decl).value or "").replace(" ", "")
+        if d and d not in [x[1] for x in decls]:
+            dt = ws.cell(r, c_date).value
+            decls.append((dt if isinstance(dt, datetime) else datetime.max, d))
+        if isinstance(ws.cell(r, c_date).value, datetime):
+            dates.append(ws.cell(r, c_date).value)
+        shipper = shipper or str(ws.cell(r, c_ship).value or "")
+    decls.sort()
+    return {"decls": [d for _, d in decls], "permit": min(dates) if dates else None, "shipper": shipper}
+
+
 def make_cover(out: Path, no: str, info: dict, nosend: str | None, remit_yen=None, many=False):
+    """表紙を作る。info["decls"] があれば、申告番号を1件ずつ別の行に並べる。"""
     wb = openpyxl.load_workbook(open_template(TPL_COVER, _TPL_COVER_B64))
     if nosend is None:
         wb.remove(wb.worksheets[1])
@@ -628,8 +650,17 @@ def make_cover(out: Path, no: str, info: dict, nosend: str | None, remit_yen=Non
         ymd = ("E10", "H10", "J10")
         if nosend in ("着払", "無償"):
             ws["H1" if nosend == "着払" else "J1"].fill = HILITE
+    decls = info.get("decls") or [info["decl"].replace(" ", "")]
     ws["E3"] = no
-    ws["E5"] = info["decl"] if many else info["decl"].replace(" ", "")
+    if "E5:Q5" not in {str(m) for m in ws.merged_cells.ranges}:
+        ws.merge_cells("E5:Q5")
+    from copy import copy
+    from openpyxl.styles import Alignment
+    ws["E5"] = "\n".join(decls)
+    al = copy(ws["E5"].alignment)
+    ws["E5"].alignment = Alignment(horizontal=al.horizontal or "left", vertical="center", wrap_text=True)
+    size = ws["E5"].font.sz or 11
+    ws.row_dimensions[5].height = max(30, len(decls) * (size * 1.5 + 2))
     ws["E7"] = info["shipper"]
     if info["permit"]:
         for cell, v in zip(ymd, (info["permit"].year, info["permit"].month, info["permit"].day)):
@@ -882,16 +913,8 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
     wb.save(ledger)
     fmap[fkey] = no
     fmap_path.write_text(json.dumps(fmap, ensure_ascii=False, indent=1), encoding="utf8")
-    cover = folder / "表紙" / f"表紙_{no}.xlsx"
-    if not cover.exists():
-        make_cover(cover, no, info, a.nosend)
-    elif shared:  # 同月まとめの2件目以降: 既存の表紙の申告番号欄に追記する
-        cwb = openpyxl.load_workbook(cover)
-        cws = cwb.worksheets[0]
-        cur = str(cws["E5"].value or "")
-        if want not in cur:
-            cws["E5"] = f"{cur}、{want}" if cur else want
-            cwb.save(cover)
+    cd = cover_data(ws, no, bool(a.nosend))  # 台帳の同じ管理番号の申告番号を、全件ならべる
+    make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, cd, a.nosend)
     d = f"{info['permit']:%Y/%m/%d}" if info["permit"] else "(許可日は手入力)"
     note = ("  ※同じフォルダのため管理番号をまとめました" if by_folder
             else "  ※同月の同じ仕出人のため管理番号をまとめました") if shared else ""
@@ -1014,7 +1037,8 @@ def save_group(a, root: Path, g: dict) -> int:
             if p and cur == "JPY" and p["qty"] and yen:
                 put(row, 11, round(yen / p["qty"], 3))
         # 黄色: 自動で埋まらなかった欄、確認が必要な欄
-        warn = [c for c in (4, 5, 6, 7, 9, 10, 12, 13, 14, 15) if ws.cell(row, c).value in (None, "")]
+        check = (4, 5, 6, 7, 9, 10, 12, 13, 14, 15) if READ_AMOUNTS else (4, 5, 9, 10, 13, 14, 15)
+        warn = [c for c in check if ws.cell(row, c).value in (None, "")]
         if p and not p["shipper_sure"]:
             warn += [4, 14]
         if rem and not p and not rem["supplier_sure"]:
@@ -1031,16 +1055,17 @@ def save_group(a, root: Path, g: dict) -> int:
         fmap[fkey] = no
         fmap_path.write_text(json.dumps(fmap, ensure_ascii=False, indent=1), encoding="utf8")
 
-    # 表紙(管理番号ごとに1枚。申告番号は全件を並べる)
-    base = dict(items[0]) if items else {"decl": "", "permit": rem["date"], "shipper": rem["supplier"]}
-    base["decl"] = "、".join(p["decl"].replace(" ", "") for p in items) if items else ""
-    dated = [p["permit"] for p in items if p["permit"]]
-    if dated:
-        base["permit"] = min(dated)
-    cover = folder / "表紙" / f"表紙_{no}.xlsx"
-    make_cover(cover, no, base, None, rem["yen"] if rem else None, many=True)
+    # 表紙(管理番号ごとに1枚。同じ管理番号の申告番号は、台帳から全件を1件ずつ並べる)
+    cd = cover_data(ws, no, False)
+    if not cd["decls"] and rem:
+        cd = {"decls": [""], "permit": rem["date"], "shipper": rem["supplier"]}
+    make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, cd, None, rem["yen"] if (rem and READ_AMOUNTS) else None)
     d = rem["date"].strftime("%Y/%m/%d") if rem else "送金なし"
-    print(f"[OK] {no}  送金 {d}  許可通知書 {len(items)} 件" + ("  ※黄色の欄を確認" if (not rem or ambiguous) else ""))
+    if READ_AMOUNTS:
+        print(f"[OK] {no}  送金 {d}  許可通知書 {len(items)} 件" + ("  ※黄色の欄を確認" if (not rem or ambiguous) else ""))
+    else:
+        total = sum(1 for r in range(5, ws.max_row + 1) if str(ws.cell(r, 3).value or "") == no)
+        print(f"[OK] {no}  {', '.join(p['decl'] for p in items)}  (この管理番号の申告番号: {total} 件)")
     return 1
 
 
