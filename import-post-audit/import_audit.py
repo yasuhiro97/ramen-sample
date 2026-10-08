@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 l (表紙のひな形をシート名で探す)"
+VERSION = "2026-10-08 m (表紙に輸入許可日も1件ずつ記載)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -616,21 +616,22 @@ def add_nosend(ws, no, office, info):
 
 # ---------- 表紙 ----------
 def cover_data(ws, no: str, nosend: bool) -> dict:
-    """台帳から、同じ管理番号の申告番号(全件)・許可日(最も早い日)・仕出人を集める。"""
+    """台帳から、同じ管理番号の申告番号(全件)と、その許可日を、許可日の順に集める。"""
     c_no, c_decl, c_date, c_ship = (2, 9, 11, 10) if nosend else (3, 13, 15, 14)
-    decls, dates, shipper = [], [], ""
+    rows, shipper = [], ""
     for r in range(4 if nosend else 5, ws.max_row + 1):  # 送金ありシートの4行目は「例」
         if str(ws.cell(r, c_no).value or "") != no:
             continue
         d = str(ws.cell(r, c_decl).value or "").replace(" ", "")
-        if d and d not in [x[1] for x in decls]:
-            dt = ws.cell(r, c_date).value
-            decls.append((dt if isinstance(dt, datetime) else datetime.max, d))
-        if isinstance(ws.cell(r, c_date).value, datetime):
-            dates.append(ws.cell(r, c_date).value)
+        dt = ws.cell(r, c_date).value
+        dt = dt if isinstance(dt, datetime) else None
+        if d and d not in [x[1] for x in rows]:
+            rows.append((dt or datetime.max, d, dt))
         shipper = shipper or str(ws.cell(r, c_ship).value or "")
-    decls.sort()
-    return {"decls": [d for _, d in decls], "permit": min(dates) if dates else None, "shipper": shipper}
+    rows.sort(key=lambda x: (x[0], x[1]))
+    dates = [x[2] for x in rows]
+    known = [d for d in dates if d]
+    return {"decls": [x[1] for x in rows], "dates": dates, "permit": min(known) if known else None, "shipper": shipper}
 
 
 def load_cover_sheet(nosend: bool):
@@ -666,19 +667,34 @@ def make_cover(out: Path, no: str, info: dict, nosend: str | None, remit_yen=Non
         if nosend in ("着払", "無償"):
             ws["H1" if nosend == "着払" else "J1"].fill = HILITE
     decls = info.get("decls") or [info["decl"].replace(" ", "")]
+    dates = list(info.get("dates") or [info["permit"]])
+    dates = (dates + [None] * len(decls))[:len(decls)]
     ws["E3"] = no
     if "E5:Q5" not in {str(m) for m in ws.merged_cells.ranges}:
         ws.merge_cells("E5:Q5")
     from copy import copy
     from openpyxl.styles import Alignment
-    ws["E5"] = "\n".join(decls)
-    al = copy(ws["E5"].alignment)
-    ws["E5"].alignment = Alignment(horizontal=al.horizontal or "left", vertical="center", wrap_text=True)
+
+    def multiline(cell, values, horizontal=None):
+        ws[cell] = "\n".join(values)
+        al = copy(ws[cell].alignment)
+        ws[cell].alignment = Alignment(horizontal=horizontal or al.horizontal, vertical="center", wrap_text=True)
+
+    multiline("E5", decls, "center" if len(decls) > 1 else None)
     size = ws["E5"].font.sz or 11
-    ws.row_dimensions[5].height = max(30, len(decls) * (size * 1.5 + 2))
+    height = max(30, len(decls) * (size * 1.5 + 2))
+    ws.row_dimensions[5].height = height
     ws["E7"] = info["shipper"]
-    if info["permit"]:
-        for cell, v in zip(ymd, (info["permit"].year, info["permit"].month, info["permit"].day)):
+    # 輸入許可年月日: 申告番号と同じ順に、1件ずつ別の行にする
+    labels = ("G10", "I10", "K10") if nosend else ("H10", "J10", "L10")
+    if len(decls) > 1 and any(dates):
+        for cell, lab, pick in zip(ymd, labels, (lambda d: d.year, lambda d: d.month, lambda d: d.day)):
+            multiline(cell, [str(pick(d)) if d else "" for d in dates])
+            multiline(lab, [ws[lab].value or ""] * len(decls))
+        size10 = ws[ymd[0]].font.sz or 11
+        ws.row_dimensions[10].height = max(30, len(decls) * (size10 * 1.5 + 2))
+    elif dates and dates[0]:
+        for cell, v in zip(ymd, (dates[0].year, dates[0].month, dates[0].day)):
             ws[cell] = v
     wb.save(out)
 
