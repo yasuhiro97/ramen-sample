@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 k (金額は読まない・表紙に申告番号を全件並べる)"
+VERSION = "2026-10-08 l (表紙のひな形をシート名で探す)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -633,20 +633,35 @@ def cover_data(ws, no: str, nosend: bool) -> dict:
     return {"decls": [d for _, d in decls], "permit": min(dates) if dates else None, "shipper": shipper}
 
 
+def load_cover_sheet(nosend: bool):
+    """表紙のひな形から、海外送金あり/なしのシートを探して返す(他のシートは消す)。
+    templates のひな形に目的のシートが無ければ、埋め込みのひな形を使う。"""
+    want = "海外送金なし" if nosend else "海外送金あり"
+    for src in (TPL_COVER, None):
+        try:
+            wb = openpyxl.load_workbook(open_template(TPL_COVER, _TPL_COVER_B64) if src else
+                                        __import__("io").BytesIO(__import__("base64").b64decode("".join(_TPL_COVER_B64.split()))))
+        except Exception:
+            continue
+        for sh in wb.worksheets:
+            if str(sh["A1"].value or "").strip().startswith(want):
+                for other in list(wb.worksheets):
+                    if other is not sh:
+                        wb.remove(other)
+                return wb, sh
+    raise ValueError("表紙のひな形に「" + want + "」のシートが見つかりません")
+
+
 def make_cover(out: Path, no: str, info: dict, nosend: str | None, remit_yen=None, many=False):
     """表紙を作る。info["decls"] があれば、申告番号を1件ずつ別の行に並べる。"""
-    wb = openpyxl.load_workbook(open_template(TPL_COVER, _TPL_COVER_B64))
+    wb, ws = load_cover_sheet(nosend is not None)
     if nosend is None:
-        wb.remove(wb.worksheets[1])
-        ws = wb.worksheets[0]
         ws["E16"] = None  # 見本の「乙仲 No.」を消す
         ymd = ("E10", "I10", "K10")
         if remit_yen:
             ws["J48"] = int(remit_yen)
             ws["J48"].number_format = "#,##0"
     else:
-        wb.remove(wb.worksheets[0])
-        ws = wb.worksheets[0]
         ymd = ("E10", "H10", "J10")
         if nosend in ("着払", "無償"):
             ws["H1" if nosend == "着払" else "J1"].fill = HILITE
