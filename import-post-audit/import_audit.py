@@ -298,9 +298,20 @@ def gui() -> int:
     if SETTINGS.exists():
         conf = json.loads(SETTINGS.read_text(encoding="utf8"))
 
-    src = filedialog.askdirectory(title="許可通知書の入っているフォルダを選んでください",
-                                  initialdir=conf.get("last_dir") or str(Path.home()))
+    # まず場所の貼り付け欄を出す(ドライブの隠しフォルダは選択画面から選べないことがあるため)
+    src = simpledialog.askstring("フォルダの場所",
+                                 "許可通知書のフォルダの場所を貼り付けてください。\n"
+                                 "(エクスプローラーのアドレス欄をコピー → ここで Ctrl+V)\n\n"
+                                 "空欄のまま OK を押すと、フォルダ選択画面が開きます。",
+                                 initialvalue=conf.get("last_dir", ""), parent=root_win)
+    if src is None:
+        return 1
+    src = src.strip().strip('"')
     if not src:
+        src = filedialog.askdirectory(title="許可通知書の入っているフォルダを選んでください",
+                                      initialdir=str(Path.home()))
+    if not src or not Path(src).is_dir():
+        messagebox.showerror("フォルダが見つかりません", f"次の場所が見つかりません:\n{src}")
         return 1
     office = simpledialog.askstring("事業所名", "台帳の「事業所名」に入れる名前(例: 林六／東京)",
                                     initialvalue=conf.get("office", ""), parent=root_win)
