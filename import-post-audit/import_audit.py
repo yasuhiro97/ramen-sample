@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 m (表紙に輸入許可日も1件ずつ記載)"
+VERSION = "2026-10-08 n (対象の月を指定・読み取りの進み具合を表示)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -380,7 +380,7 @@ def read_docs(pdf: Path, suppliers=(), products=None):
     for i, t in enumerate(texts):
         items = None
         if not t.strip():
-            if i >= OCR_MAX_PAGES:
+            if i >= OCR_MAX_PAGES or SKIP_OCR_NAME.search(pdf.name):
                 continue
             items = ocr_items(pdf, i)
             t = "\n".join(x[2] for x in items)
@@ -744,11 +744,43 @@ def release_lock(path: Path) -> None:
         pass
 
 
+# 画像だけのPDFでも、名前から許可通知書ではないと分かるものは、時間のかかるOCRを省く
+SKIP_OCR_NAME = re.compile(r"請求|INVOICE|PROFORMA|PACKING|\bPO\b|納入予定|予定表|A\.?N\b|検量|立替|振込|"
+                           r"_SUR|_CHK|HAYASHI (CO|DOC)|依頼書|計算書|表紙|見積|B/?L|WAYBILL|CERT", re.I)
+
+
+def parse_months(text: str):
+    """「2026/4-2026/9」→ ((2026,4),(2026,9))。空欄は None(全部)。"""
+    t = (text or "").strip().replace("〜", "-").replace("～", "-").replace("~", "-")
+    if not t:
+        return None
+    m = re.fullmatch(r"(\d{4})[/年.](\d{1,2})月?\s*-\s*(\d{4})[/年.](\d{1,2})月?", t)
+    if not m:
+        raise SystemExit("月の指定は「2026/4-2026/9」の形で入力してください")
+    return (int(m.group(1)), int(m.group(2))), (int(m.group(3)), int(m.group(4)))
+
+
+def month_ok(pdf: Path, rng) -> bool:
+    """パスの一番深い「2026年4月」形式のフォルダ名が、範囲に入っているか。"""
+    if not rng:
+        return True
+    found = re.findall(r"(\d{4})年\s*(\d{1,2})月", str(pdf))
+    if not found:
+        return False
+    ym = (int(found[-1][0]), int(found[-1][1]))
+    return rng[0] <= ym <= rng[1]
+
+
 def run_all(a, root: Path, paths, confirm=None) -> int:
     """PDFを読み、送金ごとにまとめて表示し、(確認のうえ)台帳と表紙に保存する。保存した件数を返す。"""
     suppliers, products = load_suppliers(root), load_products(root)
     permits, remits, requests, skipped, seen, errors = [], [], [], 0, set(), []
-    for pdf in collect(paths):
+    files = [f for f in collect(paths) if month_ok(f, getattr(a, "months", None))]
+    if getattr(a, "months", None):
+        print(f"対象の月: {a.months[0][0]}/{a.months[0][1]} 〜 {a.months[1][0]}/{a.months[1][1]}(PDF {len(files)} 件)")
+    for i, pdf in enumerate(files, 1):
+        if i % 10 == 1 or i == len(files):
+            print(f"  読み取り中 {i}/{len(files)}  {pdf.name}", flush=True)
         try:
             ps, rs, qs = read_docs(pdf, suppliers, products)
         except ValueError:
@@ -847,10 +879,21 @@ def gui() -> int:
         if nosend not in ("着払", "無償", "乙仲"):
             messagebox.showerror("入力エラー", "「着払」「無償」「乙仲」のどれかを入力してください")
             return 1
-    SETTINGS.write_text(json.dumps({"office": office, "last_dir": src}, ensure_ascii=False), encoding="utf8")
+    months_text = simpledialog.askstring("対象の月", "対象の月を入力してください(フォルダ名の「2026年4月」の形)。\n"
+                                         "例: 2026/4-2026/9\n空欄のままだと、フォルダ内のすべてが対象です。",
+                                         initialvalue=conf.get("months", ""), parent=root_win)
+    if months_text is None:
+        return 1
+    try:
+        months = parse_months(months_text)
+    except SystemExit as e:
+        messagebox.showerror("入力エラー", str(e))
+        return 1
+    SETTINGS.write_text(json.dumps({"office": office, "last_dir": src, "months": months_text}, ensure_ascii=False),
+                        encoding="utf8")
 
     out = desktop() / "輸入事後調査"
-    a = Namespace(office=office, nosend=nosend, period=None, dry_run=False, out=out)
+    a = Namespace(office=office, nosend=nosend, period=None, dry_run=False, out=out, months=months)
     print(f"読み取り中: {src}\n(スキャンPDFが多いと時間がかかります)\n")
 
     def confirm(n):
@@ -890,9 +933,11 @@ def main():
     ap.add_argument("--office", default="", help="事業所名/担当(例: 林六／東京)")
     ap.add_argument("--nosend", choices=["着払", "無償", "乙仲"], help="海外送金なしの場合の種別")
     ap.add_argument("--period", type=int, help="期(省略時は今日の日付から判定)")
+    ap.add_argument("--months", help="対象の月(フォルダ名の「2026年4月」)。例: 2026/4-2026/9。省略時は全部")
     ap.add_argument("--dry-run", action="store_true", help="読み取り結果を表示するだけで保存しない(検証用)")
     ap.add_argument("--out", type=Path, help="出力先(省略時はデスクトップ/輸入事後調査)")
     a = ap.parse_args()
+    a.months = parse_months(a.months)
 
     root = a.out or desktop() / "輸入事後調査"
     ok = run_all(a, root, a.pdf)
