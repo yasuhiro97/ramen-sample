@@ -32,6 +32,9 @@ SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
 
+# 同じ月(輸入許可日の年月)に複数あっても、管理番号を1つにまとめる仕出人
+MERGE_MONTHLY = ["TAEKWANG INDUSTRIAL CO.,LTD."]
+
 
 # ---------- 期・出力先 ----------
 def fiscal_period(d: datetime) -> int:
@@ -230,6 +233,20 @@ def next_row(ws, key_col: int) -> int:
     return max(r + 1, 5 if ws.title == SHEET_SEND else 4)
 
 
+def find_shared_no(ws, nosend: bool, info: dict) -> str | None:
+    """同じ仕出人・同じ許可月の行が台帳にあれば、その管理番号を返す(まとめ対象の仕出人のみ)。"""
+    key = norm_name(info["shipper"])
+    if not info["permit"] or key not in {norm_name(n) for n in MERGE_MONTHLY}:
+        return None
+    no_col, ship_col, date_col = (2, 10, 11) if nosend else (3, 14, 15)
+    for r in range(5 if not nosend else 4, ws.max_row + 1):
+        d, no, ship = ws.cell(r, date_col).value, ws.cell(r, no_col).value, ws.cell(r, ship_col).value
+        if (no and ship and isinstance(d, datetime) and norm_name(str(ship)) == key
+                and (d.year, d.month) == (info["permit"].year, info["permit"].month)):
+            return str(no)
+    return None
+
+
 def add_send(ws, no, office, info):
     r = next_row(ws, 3)
     vals = {2: office, 3: no, 13: info["decl"], 14: info["shipper"], 4: info["shipper"],
@@ -409,20 +426,31 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
     if dup:  # 同じ申告番号の二重登録を防ぐ
         print(f"[SKIP] {pdf.name}: 申告番号 {info['decl']} は台帳の {dup[0]} 行目に登録済み", file=sys.stderr)
         return 0
+    shared = find_shared_no(ws, bool(a.nosend), info)
     if a.nosend:
-        no = next_no(ws, 2, "経", period)
+        no = shared or next_no(ws, 2, "経", period)
         row = add_nosend(ws, no, a.office, info)
     else:
-        no = next_no(ws, 3, "", period)
+        no = shared or next_no(ws, 3, "", period)
         row = add_send(ws, no, a.office, info)
     if not info["shipper_sure"]:
         for c in ((row, 3), (row, 10)) if a.nosend else ((row, 4), (row, 14)):
             ws.cell(*c).fill = HILITE
         print(f"      仕出人『{info['shipper']}』は照合できませんでした(黄色の欄を要確認)")
     wb.save(ledger)
-    make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, info, a.nosend)
+    cover = folder / "表紙" / f"表紙_{no}.xlsx"
+    if not cover.exists():
+        make_cover(cover, no, info, a.nosend)
+    elif shared:  # 同月まとめの2件目以降: 既存の表紙の申告番号欄に追記する
+        cwb = openpyxl.load_workbook(cover)
+        cws = cwb.worksheets[0]
+        cur = str(cws["E5"].value or "")
+        if want not in cur:
+            cws["E5"] = f"{cur}、{want}" if cur else want
+            cwb.save(cover)
     d = f"{info['permit']:%Y/%m/%d}" if info["permit"] else "(許可日は手入力)"
-    print(f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  許可日 {d}")
+    note = "  ※同月の同じ仕出人のため管理番号をまとめました" if shared else ""
+    print(f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  許可日 {d}{note}")
     return 1
 
 
