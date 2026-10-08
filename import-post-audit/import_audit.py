@@ -15,6 +15,7 @@
 送金日・金額・乙仲業者名など PDF にない項目は、台帳の空欄に手入力する。
 """
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -426,7 +427,14 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
     if dup:  # 同じ申告番号の二重登録を防ぐ
         print(f"[SKIP] {pdf.name}: 申告番号 {info['decl']} は台帳の {dup[0]} 行目に登録済み", file=sys.stderr)
         return 0
-    shared = find_shared_no(ws, bool(a.nosend), info)
+    # 管理番号をまとめる: ①同じフォルダの許可通知書 ②同月の同じ仕出人(MERGE_MONTHLY)
+    fmap_path = folder / "フォルダ別管理番号.json"
+    fmap = json.loads(fmap_path.read_text(encoding="utf8")) if fmap_path.exists() else {}
+    fkey = f"{'なし' if a.nosend else 'あり'}|{pdf.parent}"
+    used = {str(ws.cell(r, 2 if a.nosend else 3).value) for r in range(4, ws.max_row + 1)}
+    shared = fmap.get(fkey) if fmap.get(fkey) in used else None
+    by_folder = bool(shared)
+    shared = shared or find_shared_no(ws, bool(a.nosend), info)
     if a.nosend:
         no = shared or next_no(ws, 2, "経", period)
         row = add_nosend(ws, no, a.office, info)
@@ -438,6 +446,8 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
             ws.cell(*c).fill = HILITE
         print(f"      仕出人『{info['shipper']}』は照合できませんでした(黄色の欄を要確認)")
     wb.save(ledger)
+    fmap[fkey] = no
+    fmap_path.write_text(json.dumps(fmap, ensure_ascii=False, indent=1), encoding="utf8")
     cover = folder / "表紙" / f"表紙_{no}.xlsx"
     if not cover.exists():
         make_cover(cover, no, info, a.nosend)
@@ -449,7 +459,8 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
             cws["E5"] = f"{cur}、{want}" if cur else want
             cwb.save(cover)
     d = f"{info['permit']:%Y/%m/%d}" if info["permit"] else "(許可日は手入力)"
-    note = "  ※同月の同じ仕出人のため管理番号をまとめました" if shared else ""
+    note = ("  ※同じフォルダのため管理番号をまとめました" if by_folder
+            else "  ※同月の同じ仕出人のため管理番号をまとめました") if shared else ""
     print(f"[OK] {pdf.name} -> {no}  申告番号 {info['decl']}  許可日 {d}{note}")
     return 1
 
