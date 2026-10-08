@@ -191,19 +191,28 @@ def read_permits(pdf: Path, suppliers=()) -> list[dict]:
     return out
 
 
+DEFAULT_SUPPLIERS = ["TAEKWANG INDUSTRIAL CO.,LTD.", "CHUEN HUAH CHEMICAL CO.,LTD."]
+
+
 def load_suppliers(root: Path) -> list[str]:
-    """仕入先名の一覧: 台帳(全期)の仕入先名 + 仕入先名.txt(1行1社)。"""
-    names = set()
+    """仕入先名の一覧。正式名(仕入先名.txt)を先に、台帳に出てきた表記ゆれを後ろに並べる。
+    同じ綴りなら先頭(正式名)が優先されるので、OCRの崩れた表記が台帳に残らない。"""
     f = root / "仕入先名.txt"
-    if f.exists():
-        names |= {l.strip() for l in f.read_text(encoding="utf8").splitlines() if l.strip()}
-    for lg in root.glob("第*期/輸入明細一覧_*.xlsx"):
+    if not f.exists():  # 初回は見本を作る。社名を足したいときは1行1社で追記する
+        root.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join(DEFAULT_SUPPLIERS) + "\n", encoding="utf8")
+    official = [l.strip() for l in f.read_text(encoding="utf8").splitlines() if l.strip()]
+    seen = {norm_name(n) for n in official}
+    extra = []
+    for lg in sorted(root.glob("第*期/輸入明細一覧_*.xlsx")):
         wb = openpyxl.load_workbook(lg, read_only=True)
         for ws, col in ((wb[SHEET_SEND], 4), (wb[SHEET_NOSEND], 3)):
             for r in ws.iter_rows(min_row=4, min_col=col, max_col=col, values_only=True):
-                if r[0]:
-                    names.add(str(r[0]).strip())
-    return sorted(names)
+                n = str(r[0]).strip() if r[0] else ""
+                if n and norm_name(n) not in seen:
+                    seen.add(norm_name(n))
+                    extra.append(n)
+    return official + extra
 
 
 # ---------- 台帳 ----------
@@ -364,6 +373,7 @@ def gui() -> int:
         messagebox.showinfo("結果", "許可通知書が見つかりませんでした")
         return 1
     print()
+    found.sort(key=lambda x: (x[1]["permit"] is None, x[1]["permit"] or datetime.max))  # 許可日の古い順
     for pdf, info in found:
         process(a, out, pdf, info)  # dry_run=True: 内容を表示するだけ
     if not messagebox.askyesno("保存の確認", f"{len(found)} 件の許可通知書を読み取りました。\n"
@@ -393,6 +403,7 @@ def main():
 
     root = a.out or desktop() / "輸入事後調査"
     ok = 0
+    found = []
     suppliers = load_suppliers(root)
     for pdf in collect(a.pdf):
         try:
@@ -400,8 +411,10 @@ def main():
         except Exception as e:
             print(f"[NG] {pdf.name}: {e}", file=sys.stderr)
             continue
-        for info in infos:
-            ok += process(a, root, pdf, info)
+        found.extend((pdf, info) for info in infos)
+    # 許可日の古い順に処理する(管理番号が日付順になる)
+    for pdf, info in sorted(found, key=lambda x: (x[1]["permit"] is None, x[1]["permit"] or datetime.max)):
+        ok += process(a, root, pdf, info)
     print(f"{ok} 件を確認しました(保存なし)" if a.dry_run else f"{ok} 件を {root} に保存しました")
     return 0 if ok else 1
 
