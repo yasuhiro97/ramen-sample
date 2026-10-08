@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 n (対象の月を指定・読み取りの進み具合を表示)"
+VERSION = "2026-10-08 o (処理する月をチェックで選ぶ)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -761,14 +761,66 @@ def parse_months(text: str):
 
 
 def month_ok(pdf: Path, rng) -> bool:
-    """パスの一番深い「2026年4月」形式のフォルダ名が、範囲に入っているか。"""
+    """パスの一番深い「2026年4月」形式のフォルダ名が、範囲(または選んだ月の集合)に入っているか。"""
     if not rng:
         return True
     found = re.findall(r"(\d{4})年\s*(\d{1,2})月", str(pdf))
     if not found:
         return False
     ym = (int(found[-1][0]), int(found[-1][1]))
-    return rng[0] <= ym <= rng[1]
+    return ym in rng if isinstance(rng, (set, frozenset)) else rng[0] <= ym <= rng[1]
+
+
+def detect_months(src: str, max_depth: int = 3) -> list[tuple[int, int]]:
+    """フォルダの下にある「2026年4月」形式のフォルダ名を集める。"""
+    import os
+    base = Path(src)
+    found = set()
+    for dirpath, dirs, _ in os.walk(base):
+        depth = len(Path(dirpath).relative_to(base).parts)
+        if depth >= max_depth:
+            dirs[:] = []
+        for d in dirs:
+            m = re.search(r"(\d{4})年\s*(\d{1,2})月", d)
+            if m:
+                found.add((int(m.group(1)), int(m.group(2))))
+    return sorted(found)
+
+
+def choose_months(root_win, months):
+    """処理する月を、チェックボックスで選ぶ。キャンセルは None。"""
+    import tkinter as tk
+    win = tk.Toplevel(root_win)
+    win.title("処理する月を選んでください")
+    win.attributes("-topmost", True)
+    tk.Label(win, text="処理する月にチェックを入れてください").pack(padx=14, pady=(14, 6), anchor="w")
+    frame = tk.Frame(win)
+    frame.pack(padx=14, pady=4)
+    vars_ = {}
+    for i, ym in enumerate(months):
+        v = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame, text=f"{ym[0]}年{ym[1]}月", variable=v).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=3)
+        vars_[ym] = v
+    result = {"ok": False}
+
+    def set_all(value):
+        for v in vars_.values():
+            v.set(value)
+
+    def ok():
+        result["ok"] = True
+        win.destroy()
+    bar = tk.Frame(win)
+    bar.pack(padx=14, pady=(8, 14), fill="x")
+    tk.Button(bar, text="すべて選ぶ", command=lambda: set_all(True)).pack(side="left")
+    tk.Button(bar, text="すべて外す", command=lambda: set_all(False)).pack(side="left", padx=6)
+    tk.Button(bar, text="キャンセル", command=win.destroy).pack(side="right")
+    tk.Button(bar, text="OK", width=8, command=ok).pack(side="right", padx=6)
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.lift()
+    win.focus_force()
+    root_win.wait_window(win)
+    return {ym for ym, v in vars_.items() if v.get()} if result["ok"] else None
 
 
 def run_all(a, root: Path, paths, confirm=None) -> int:
@@ -777,7 +829,10 @@ def run_all(a, root: Path, paths, confirm=None) -> int:
     permits, remits, requests, skipped, seen, errors = [], [], [], 0, set(), []
     files = [f for f in collect(paths) if month_ok(f, getattr(a, "months", None))]
     if getattr(a, "months", None):
-        print(f"対象の月: {a.months[0][0]}/{a.months[0][1]} 〜 {a.months[1][0]}/{a.months[1][1]}(PDF {len(files)} 件)")
+        mm = a.months
+        label = ("、".join(f"{y}年{m}月" for y, m in sorted(mm)) if isinstance(mm, (set, frozenset))
+                 else f"{mm[0][0]}年{mm[0][1]}月 〜 {mm[1][0]}年{mm[1][1]}月")
+        print(f"対象の月: {label}(PDF {len(files)} 件)")
     for i, pdf in enumerate(files, 1):
         if i % 10 == 1 or i == len(files):
             print(f"  読み取り中 {i}/{len(files)}  {pdf.name}", flush=True)
@@ -879,18 +934,16 @@ def gui() -> int:
         if nosend not in ("着払", "無償", "乙仲"):
             messagebox.showerror("入力エラー", "「着払」「無償」「乙仲」のどれかを入力してください")
             return 1
-    months_text = simpledialog.askstring("対象の月", "対象の月を入力してください(フォルダ名の「2026年4月」の形)。\n"
-                                         "例: 2026/4-2026/9\n空欄のままだと、フォルダ内のすべてが対象です。",
-                                         initialvalue=conf.get("months", ""), parent=root_win)
-    if months_text is None:
-        return 1
-    try:
-        months = parse_months(months_text)
-    except SystemExit as e:
-        messagebox.showerror("入力エラー", str(e))
-        return 1
-    SETTINGS.write_text(json.dumps({"office": office, "last_dir": src, "months": months_text}, ensure_ascii=False),
-                        encoding="utf8")
+    months = None
+    found_months = detect_months(src)
+    if found_months:
+        months = choose_months(root_win, found_months)
+        if months is None:
+            return 1
+        if not months:
+            messagebox.showinfo("対象の月", "月が1つも選ばれていません")
+            return 1
+    SETTINGS.write_text(json.dumps({"office": office, "last_dir": src}, ensure_ascii=False), encoding="utf8")
 
     out = desktop() / "輸入事後調査"
     a = Namespace(office=office, nosend=nosend, period=None, dry_run=False, out=out, months=months)
