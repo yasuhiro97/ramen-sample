@@ -334,13 +334,14 @@ def gui() -> int:
     a = Namespace(office=office, nosend=nosend, period=None, dry_run=True, out=out)
     suppliers = load_suppliers(out)
     print(f"読み取り中: {src}\n(スキャンPDFが多いと時間がかかります)\n")
-    found = []
+    found, skipped = [], 0
     for pdf in collect([src]):
         try:
             for info in read_permits(pdf, suppliers):
                 found.append((pdf, info))
-        except Exception as e:
-            print(f"[対象外] {pdf.name}: {e}")
+        except Exception:
+            skipped += 1  # 請求書・到着案内など、許可通知書以外のPDF
+    print(f"許可通知書以外のPDF {skipped} 件はスキップしました。\n")
     if not found:
         messagebox.showinfo("結果", "許可通知書が見つかりませんでした")
         return 1
