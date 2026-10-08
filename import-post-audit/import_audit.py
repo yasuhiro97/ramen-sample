@@ -29,6 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
+VERSION = "2026-10-08 e (同月/同フォルダまとめ・仕入先名統一・許可日順)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -312,6 +313,7 @@ SETTINGS = Path(__file__).resolve().parent / "settings.json"
 
 def gui() -> int:
     """引数なしで起動したとき(ダブルクリック用)。画面でフォルダ・事業所名・種別を選ぶ。"""
+    print(f"ツールの版: {VERSION}\n")
     import json
     import os
     import tkinter as tk
