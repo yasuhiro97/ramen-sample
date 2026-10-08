@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 o (処理する月をチェックで選ぶ)"
+VERSION = "2026-10-08 p (処理する月をチェックで選ぶ・見つかった月を表示)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -935,14 +935,30 @@ def gui() -> int:
             messagebox.showerror("入力エラー", "「着払」「無償」「乙仲」のどれかを入力してください")
             return 1
     months = None
-    found_months = detect_months(src)
+    found_months = detect_months(src, 4)
+    print("フォルダの中で見つかった月: " + ("、".join(f"{y}年{m}月" for y, m in found_months) if found_months else "なし"))
     if found_months:
-        months = choose_months(root_win, found_months)
-        if months is None:
-            return 1
-        if not months:
+        try:
+            months = choose_months(root_win, found_months)
+            if months is None:
+                return 1  # キャンセル
+        except Exception as e:  # 画面が出せない環境では、文字入力で代用する
+            print(f"(月の選択画面を開けませんでした: {e})")
+            text = simpledialog.askstring("対象の月", "対象の月を入力してください。例: 2026/4-2026/9\n空欄ならすべて処理します。",
+                                          parent=root_win)
+            if text is None:
+                return 1
+            try:
+                months = parse_months(text)
+            except SystemExit as e2:
+                messagebox.showerror("入力エラー", str(e2))
+                return 1
+        if months is not None and not months:
             messagebox.showinfo("対象の月", "月が1つも選ばれていません")
             return 1
+    else:
+        print("※ 「2026年4月」のような月のフォルダが見つかりません。選んだフォルダの中のすべてを処理します。\n"
+              "  月を選びたい場合は、「81期」のフォルダ(月のフォルダが入っている上の階層)を指定してください。")
     SETTINGS.write_text(json.dumps({"office": office, "last_dir": src}, ensure_ascii=False), encoding="utf8")
 
     out = desktop() / "輸入事後調査"
