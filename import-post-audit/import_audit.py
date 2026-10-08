@@ -280,7 +280,78 @@ def collect(paths):
             yield p
 
 
+SETTINGS = Path(__file__).resolve().parent / "settings.json"
+
+
+def gui() -> int:
+    """引数なしで起動したとき(ダブルクリック用)。画面でフォルダ・事業所名・種別を選ぶ。"""
+    import json
+    import os
+    import tkinter as tk
+    from argparse import Namespace
+    from tkinter import filedialog, messagebox, simpledialog
+
+    root_win = tk.Tk()
+    root_win.withdraw()
+    root_win.attributes("-topmost", True)
+    conf = {}
+    if SETTINGS.exists():
+        conf = json.loads(SETTINGS.read_text(encoding="utf8"))
+
+    src = filedialog.askdirectory(title="許可通知書の入っているフォルダを選んでください",
+                                  initialdir=conf.get("last_dir") or str(Path.home()))
+    if not src:
+        return 1
+    office = simpledialog.askstring("事業所名", "台帳の「事業所名」に入れる名前(例: 林六／東京)",
+                                    initialvalue=conf.get("office", ""), parent=root_win)
+    if office is None:
+        return 1
+    send = messagebox.askyesnocancel("種別", "海外送金ありの分ですか?\n\n"
+                                     "はい … 海外送金あり\nいいえ … 海外送金なし(着払・無償・乙仲)")
+    if send is None:
+        return 1
+    nosend = None
+    if not send:
+        nosend = simpledialog.askstring("海外送金なしの種別", "着払 / 無償 / 乙仲 のどれかを入力", initialvalue="着払",
+                                        parent=root_win)
+        if nosend not in ("着払", "無償", "乙仲"):
+            messagebox.showerror("入力エラー", "「着払」「無償」「乙仲」のどれかを入力してください")
+            return 1
+    SETTINGS.write_text(json.dumps({"office": office, "last_dir": src}, ensure_ascii=False), encoding="utf8")
+
+    out = desktop() / "輸入事後調査"
+    a = Namespace(office=office, nosend=nosend, period=None, dry_run=True, out=out)
+    suppliers = load_suppliers(out)
+    print(f"読み取り中: {src}\n(スキャンPDFが多いと時間がかかります)\n")
+    found = []
+    for pdf in collect([src]):
+        try:
+            for info in read_permits(pdf, suppliers):
+                found.append((pdf, info))
+        except Exception as e:
+            print(f"[対象外] {pdf.name}: {e}")
+    if not found:
+        messagebox.showinfo("結果", "許可通知書が見つかりませんでした")
+        return 1
+    print()
+    for pdf, info in found:
+        process(a, out, pdf, info)  # dry_run=True: 内容を表示するだけ
+    if not messagebox.askyesno("保存の確認", f"{len(found)} 件の許可通知書を読み取りました。\n"
+                               "画面の内容を確認して、台帳と表紙を作成しますか?"):
+        return 0
+    a.dry_run = False
+    n = sum(process(a, out, pdf, info) for pdf, info in found)
+    messagebox.showinfo("完了", f"{n} 件を保存しました。\n\n{out}")
+    try:
+        os.startfile(out)
+    except Exception:
+        pass
+    return 0
+
+
 def main():
+    if len(sys.argv) == 1:
+        return gui()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pdf", nargs="+", help="輸入許可通知書の PDF またはそのフォルダ")
     ap.add_argument("--office", default="", help="事業所名/担当(例: 林六／東京)")
