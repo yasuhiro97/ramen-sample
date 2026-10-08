@@ -54,31 +54,112 @@ def desktop() -> Path:
 
 
 # ---------- PDF 読み取り ----------
-def read_permit(pdf: Path) -> dict:
+_ocr_engine = None
+DATE_RE = re.compile(r"(20\d{2})[/年.-](\d{1,2})[/月.-](\d{1,2})")
+DECL_RE = re.compile(r"(?<!\d)(\d{3})[ \u3000]?(\d{4})[ \u3000]?(\d{4})(?!\d)")
+
+
+def ocr_items(pdf: Path):
+    """スキャン PDF を OCR し、[(y, x, text)] を上から下の順で返す(1ページ目のみ)。"""
+    global _ocr_engine
+    try:
+        import pypdfium2 as pdfium
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        raise ValueError("スキャンPDFの読み取りには `pip install rapidocr-onnxruntime pypdfium2` が必要です")
+    if _ocr_engine is None:
+        _ocr_engine = RapidOCR()
+    page = pdfium.PdfDocument(str(pdf))[0]
+    img = page.render(scale=3).to_numpy()
+    res, _ = _ocr_engine(img)
+    h = img.shape[0]
+    return [(b[0][1] / h, b[0][0], t) for b, t, _ in (res or [])]
+
+
+def norm_name(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", s.upper().replace("LID", "LTD"))
+
+
+def match_supplier(raw: str, suppliers: list[str]) -> tuple[str, bool]:
+    """OCRの崩れた仕出人名を既知の仕入先名に寄せる。(名前, 確実か) を返す。"""
+    import difflib
+    key = norm_name(raw)
+    best, score = raw, 0.0
+    for name in suppliers:
+        r = difflib.SequenceMatcher(None, key, norm_name(name)).ratio()
+        if r > score:
+            best, score = name, r
+    return (best, True) if score >= 0.85 else (raw, False)
+
+
+def parse_items(items):
+    """items: [(y比率, x, text)]。ラベルが誤認識されても数字・位置で拾う。"""
+    items = sorted(items)
+    alltext = "\n".join(t for _, _, t in items)
+    head = [t for y, _, t in items if y < 0.2]
+    decl = next((" ".join(m.groups()) for t in head if (m := DECL_RE.search(t))), None)
+    if not decl:
+        # 下部の「輸入申告番号等 11桁」
+        m = re.search(r"(?<!\d)(\d{3})(\d{4})(\d{4})(?!\d)", alltext)
+        decl = " ".join(m.groups()) if m else None
+    # 許可日: ページ下部(8割より下)の最初の日付 → なければ上部の申告年月日
+    permit = None
+    for lo in (0.8, 0.0):
+        for y, _, t in items:
+            if y >= lo and (m := DATE_RE.search(t)):
+                permit = datetime(*map(int, m.groups()))
+                break
+        if permit:
+            break
+    # 仕出人: 「出人」を含むラベルの右隣(同じ高さ)の文字列
+    shipper = ""
+    for y, x, t in items:
+        if re.search(r"仕\s*出\s*人|出\s*人$", t) and len(t) <= 6:
+            cand = [(xx, tt) for yy, xx, tt in items if abs(yy - y) < 0.012 and xx > x + 50 and re.search(r"[A-Za-z]{3}", tt)]
+            if cand:
+                shipper = min(cand)[1]
+                break
+    return decl, permit, shipper
+
+
+def read_permit(pdf: Path, suppliers: list[str] = ()) -> dict:
     with pdfplumber.open(pdf) as doc:
         text = "\n".join((p.extract_text(layout=True) or "") for p in doc.pages)
-    if not text.strip():
-        raise ValueError("文字を読み取れません(スキャン画像の PDF は未対応)。台帳に手入力してください")
-    flat = re.sub(r"[ 　]+", " ", text)
-
-    # 申告番号(11桁): 「申告番号」の後ろ、または全体で最初の 3-4-4 桁
-    m = re.search(r"申告番号\s*\n?[^\d]*?(\d{3})\s?(\d{4})\s?(\d{4})", flat)
-    if not m:
-        m = re.search(r"(?<!\d)(\d{3}) ?(\d{4}) ?(\d{4})(?!\d)", flat)
-    if not m:
-        raise ValueError("申告番号(11桁)が見つかりません")
-    decl = " ".join(m.groups())
-
-    # 輸入許可日
-    m = re.search(r"輸入許可日\s*(\d{4})[/年.-](\d{1,2})[/月.-](\d{1,2})", flat)
-    permit = datetime(*map(int, m.groups())) if m else None
-
-    # 仕出人: 「仕 出 人」の行から住所行の手前まで
+    decl = permit = None
     shipper = ""
-    m = re.search(r"仕\s*出\s*人\s*[-ー－]?\s*([^\n]+)", text)
-    if m:
-        shipper = re.sub(r"\s{2,}.*$", "", m.group(1)).strip(" -")
-    return {"decl": decl, "permit": permit, "shipper": shipper}
+    if text.strip():  # 文字情報あり
+        flat = re.sub(r"[ \u3000]+", " ", text)
+        m = re.search(r"申告番号\s*\n?[^\d]*?(\d{3})\s?(\d{4})\s?(\d{4})", flat) or DECL_RE.search(flat)
+        decl = " ".join(m.groups()) if m else None
+        m = re.search(r"輸入許可日\s*(\d{4})[/年.-](\d{1,2})[/月.-](\d{1,2})", flat)
+        permit = datetime(*map(int, m.groups())) if m else None
+        m = re.search(r"仕\s*出\s*人\s*[-ー－]?\s*([^\n]+)", text)
+        if m:
+            shipper = re.sub(r"\s{2,}.*$", "", m.group(1)).strip(" -")
+    if not (decl and permit and shipper):  # 足りなければ OCR で補う
+        d2, p2, s2 = parse_items(ocr_items(pdf))
+        decl, permit, shipper = decl or d2, permit or p2, shipper or s2
+    if not decl:
+        raise ValueError("申告番号(11桁)が見つかりません。輸入許可通知書ではない可能性があります")
+    sure = True
+    if shipper and suppliers:
+        shipper, sure = match_supplier(shipper, suppliers)
+    return {"decl": decl, "permit": permit, "shipper": shipper, "shipper_sure": sure}
+
+
+def load_suppliers(root: Path) -> list[str]:
+    """仕入先名の一覧: 台帳(全期)の仕入先名 + 仕入先名.txt(1行1社)。"""
+    names = set()
+    f = root / "仕入先名.txt"
+    if f.exists():
+        names |= {l.strip() for l in f.read_text(encoding="utf8").splitlines() if l.strip()}
+    for lg in root.glob("第*期/輸入明細一覧_*.xlsx"):
+        wb = openpyxl.load_workbook(lg, read_only=True)
+        for ws, col in ((wb[SHEET_SEND], 4), (wb[SHEET_NOSEND], 3)):
+            for r in ws.iter_rows(min_row=4, min_col=col, max_col=col, values_only=True):
+                if r[0]:
+                    names.add(str(r[0]).strip())
+    return sorted(names)
 
 
 # ---------- 台帳 ----------
@@ -154,7 +235,7 @@ def make_cover(out: Path, no: str, info: dict, nosend: str | None):
 def collect(paths):
     for p in map(Path, paths):
         if p.is_dir():
-            yield from sorted(p.glob("*.pdf"))
+            yield from sorted(p.rglob("*.pdf"))
         else:
             yield p
 
@@ -170,9 +251,10 @@ def main():
 
     root = a.out or desktop() / "輸入事後調査"
     ok = 0
+    suppliers = load_suppliers(root)
     for pdf in collect(a.pdf):
         try:
-            info = read_permit(pdf)
+            info = read_permit(pdf, suppliers)
         except Exception as e:
             print(f"[NG] {pdf.name}: {e}", file=sys.stderr)
             continue
@@ -198,6 +280,10 @@ def main():
         if dup:
             print(f"[SKIP] {pdf.name}: 申告番号 {info['decl']} は台帳の {dup[0]} 行目に登録済み", file=sys.stderr)
             continue
+        if not info["shipper_sure"]:
+            for c in ((row, 3), (row, 10)) if a.nosend else ((row, 4), (row, 14)):
+                ws.cell(*c).fill = HILITE
+            print(f"      仕出人『{info['shipper']}』は照合できませんでした(黄色の欄を要確認)")
         wb.save(ledger)
         make_cover(folder / "表紙" / f"表紙_{no}.xlsx", no, info, a.nosend)
         ok += 1

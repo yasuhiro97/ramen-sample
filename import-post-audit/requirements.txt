@@ -1,2 +1,4 @@
 openpyxl
 pdfplumber
+rapidocr-onnxruntime
+pypdfium2
