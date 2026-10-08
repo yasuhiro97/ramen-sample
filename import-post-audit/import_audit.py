@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 h (ひな形を埋め込み・置き場所を問わず動く)"
+VERSION = "2026-10-08 i (OCR補完・送金の重複解消・シート表示)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -225,6 +225,45 @@ def load_products(root: Path) -> dict[str, str]:
     return d
 
 
+def loose_amount(tok: str, cur: str = "JPY") -> float | None:
+    """OCRで , が . や : に化けた金額も読む。外貨は末尾2桁を小数、円は整数として扱う。"""
+    t = tok.strip()
+    m = re.fullmatch(r"([\d.,:; ]*\d)\s*[.,:;]\s*(\d{2})", t)
+    if m and (cur != "JPY" or m.group(2) == "00"):
+        ip, dec = re.sub(r"\D", "", m.group(1)), m.group(2)
+    else:
+        ip, dec = re.sub(r"\D", "", t), "00"
+    return float(f"{ip}.{dec}") if ip else None
+
+
+def extras_from_items(items, products: dict, have_amt: bool, have_qty: bool) -> dict:
+    """OCRの文字位置から、仕入書価格・数量を拾う(文字列の並びが崩れたときの補完)。"""
+    out = {}
+    num = re.compile(r"[\d][\d.,:; ]*")
+    if not have_amt:
+        anchors = [(y, x, t) for y, x, t in items if re.search(r"CIF|FOB|CFR|CIP|C&F", t)]
+        for y0, x0, t0 in anchors:
+            cur = next((c for c in ("JPY", "USD", "EUR", "CNY", "GBP", "THB", "AUD")
+                        if any(c in tt for yy, xx, tt in items if abs(yy - y0) < 0.04 and abs(xx - x0) < 500)), None)
+            cands = [(abs(yy - y0) * 3 + abs(xx - x0) / 3000, tt) for yy, xx, tt in items
+                     if -0.012 <= yy - y0 <= 0.05 and xx >= x0 - 80 and num.fullmatch(tt.strip()) and len(re.sub(r"\D", "", tt)) >= 3]
+            if cur and cands:
+                v = loose_amount(min(cands)[1], cur)
+                if v:
+                    out["inv_cur"], out["inv_amt"] = cur, v
+                    break
+    if not have_qty:
+        cands = []
+        for y, x, t in items:
+            m = re.fullmatch(r"\s*(\d[\d.,:; ]*)\s*K\s*G\s*", t)
+            if m and y > 0.4:
+                cands.append((y, loose_amount(m.group(1), "USD")))
+        cands = [(y, v) for y, v in cands if v]
+        if cands:
+            out["qty"], out["unit"] = sorted(cands)[0][1], "Ｋｇ"
+    return out
+
+
 def extract_extras(text: str, products: dict) -> dict:
     """許可通知書から仕入書価格(通貨・金額)・数量・商品名を拾う。"""
     flat = re.sub(r"[ 　]+", " ", text)
@@ -232,9 +271,8 @@ def extract_extras(text: str, products: dict) -> dict:
     m = re.search(r"(?:CIF|FOB|CFR|C&F|CIP)[\s\-–\\]*(JPY|USD|EUR|CNY|GBP|THB|AUD)[\s\-–\\]*" + AMT, flat)
     if m:
         out["inv_cur"], out["inv_amt"] = m.group(1), to_num(m.group(2))
-    m = re.search(r"数量\s*(?:[\(（]\s*[12１２]\s*[\)）])?\s*" + AMT + r"\s*(KGM|KG)\b", flat) or \
-        re.search(r"(?<![\d.,])" + AMT + r"\s*(KGM|KG)\b", flat)
-    if m:
+    m = re.search(r"数量\s*(?:[\(（]\s*[12１２]\s*[\)）])?\s*" + AMT + r"\s*KG\b", flat)
+    if m and to_num(m.group(1)) > 0:
         out["qty"], out["unit"] = to_num(m.group(1)), "Ｋｇ"
     up = flat.upper()
     for k, v in products.items():
@@ -319,7 +357,10 @@ def read_docs(pdf: Path, suppliers=(), products=None) -> tuple[list[dict], list[
         info = parse_items(items, suppliers) if items is not None else parse_page_text(t, suppliers)
         if info is None:
             continue
-        info.update(extract_extras(t, products))
+        ex = extract_extras(t, products)
+        if items is not None:  # OCRでは文字の並びが崩れやすいので、位置から拾った値を優先する
+            ex.update(extras_from_items(sorted(items), products, False, False))
+        info.update(ex)
         if not info["shipper"] or not find_known_supplier(info["shipper"], suppliers):
             known = find_known_supplier(t, suppliers)
             if known:
@@ -581,8 +622,9 @@ def run_all(a, root: Path, paths, confirm=None) -> int:
                 p["pdf"] = pdf
                 permits.append(p)
         for r in rs:
-            r["pdf"] = pdf
-            remits.append(r)
+            if not any((r["date"], r["cur"], r["amount"]) == (x["date"], x["cur"], x["amount"]) for x in remits):
+                r["pdf"] = pdf
+                remits.append(r)
     print(f"許可通知書 {len(permits)} 件、送金計算書 {len(remits)} 件を読み取りました"
           f"(それ以外のPDF {skipped} 件はスキップ)\n")
     if errors:
@@ -725,6 +767,8 @@ def process(a, root: Path, pdf: Path, info: dict) -> int:
     if not ledger.exists():
         new_ledger(ledger, period)
     wb = openpyxl.load_workbook(ledger)
+    for sh in wb.worksheets:
+        sh.sheet_state = "visible"
     ws = wb[SHEET_NOSEND] if a.nosend else wb[SHEET_SEND]
     col = 9 if a.nosend else 13
     want = info["decl"].replace(" ", "")
@@ -791,7 +835,17 @@ def save_group(a, root: Path, g: dict) -> int:
     if not ledger.exists():
         new_ledger(ledger, period)
     wb = openpyxl.load_workbook(ledger)
+    for sh in wb.worksheets:  # 非表示になっているシートも表示する
+        sh.sheet_state = "visible"
+    wb.active = 0
     ws = wb[SHEET_SEND]
+
+    # 前回、許可通知書が結びつかず「送金だけ」で作った行は、今回結びついたら削除する(二重にならないように)
+    if rem and items:
+        for r in range(ws.max_row, 4, -1):
+            if (not ws.cell(r, 13).value and ws.cell(r, 6).value == rem["date"]
+                    and ws.cell(r, 7).value == ("円" if rem["cur"] == "JPY" else rem["cur"])):
+                ws.delete_rows(r)
 
     # 既に台帳にある行(申告番号が同じ)は、その行を更新する
     rows = {}
