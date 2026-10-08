@@ -29,7 +29,7 @@ from openpyxl.styles import PatternFill
 HERE = Path(__file__).resolve().parent
 TPL_LEDGER = HERE / "templates" / "輸入明細一覧テンプレート.xlsx"
 TPL_COVER = HERE / "templates" / "表紙テンプレート.xlsx"
-VERSION = "2026-10-08 p (処理する月をチェックで選ぶ・見つかった月を表示)"
+VERSION = "2026-10-08 q (月の選択画面を親ウィンドウで表示)"
 SHEET_SEND = "海外送金あり"
 SHEET_NOSEND = "海外送金なし（乙仲・無償・着払）"
 HILITE = PatternFill("solid", fgColor="FFFF00")
@@ -788,18 +788,22 @@ def detect_months(src: str, max_depth: int = 3) -> list[tuple[int, int]]:
 
 
 def choose_months(root_win, months):
-    """処理する月を、チェックボックスで選ぶ。キャンセルは None。"""
+    """処理する月を、チェックボックスで選ぶ。キャンセルは None。
+    (非表示の親ウィンドウに子ウィンドウを付けると表示されない環境があるため、親そのものを表示して使う)"""
     import tkinter as tk
-    win = tk.Toplevel(root_win)
+    win = root_win
+    win.deiconify()
     win.title("処理する月を選んでください")
     win.attributes("-topmost", True)
-    tk.Label(win, text="処理する月にチェックを入れてください").pack(padx=14, pady=(14, 6), anchor="w")
-    frame = tk.Frame(win)
-    frame.pack(padx=14, pady=4)
+    box = tk.Frame(win)
+    box.pack(padx=14, pady=14)
+    tk.Label(box, text="処理する月にチェックを入れてください").pack(anchor="w", pady=(0, 6))
+    grid = tk.Frame(box)
+    grid.pack()
     vars_ = {}
     for i, ym in enumerate(months):
         v = tk.BooleanVar(value=True)
-        tk.Checkbutton(frame, text=f"{ym[0]}年{ym[1]}月", variable=v).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=3)
+        tk.Checkbutton(grid, text=f"{ym[0]}年{ym[1]}月", variable=v).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=3)
         vars_[ym] = v
     result = {"ok": False}
 
@@ -809,18 +813,22 @@ def choose_months(root_win, months):
 
     def ok():
         result["ok"] = True
-        win.destroy()
-    bar = tk.Frame(win)
-    bar.pack(padx=14, pady=(8, 14), fill="x")
+        win.quit()
+    bar = tk.Frame(box)
+    bar.pack(fill="x", pady=(10, 0))
     tk.Button(bar, text="すべて選ぶ", command=lambda: set_all(True)).pack(side="left")
     tk.Button(bar, text="すべて外す", command=lambda: set_all(False)).pack(side="left", padx=6)
-    tk.Button(bar, text="キャンセル", command=win.destroy).pack(side="right")
+    tk.Button(bar, text="キャンセル", command=win.quit).pack(side="right")
     tk.Button(bar, text="OK", width=8, command=ok).pack(side="right", padx=6)
-    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.protocol("WM_DELETE_WINDOW", win.quit)
     win.lift()
     win.focus_force()
-    root_win.wait_window(win)
-    return {ym for ym, v in vars_.items() if v.get()} if result["ok"] else None
+    print("→ 「処理する月を選んでください」の画面を開きました。タスクバーを確認してください。", flush=True)
+    win.mainloop()
+    chosen = {ym for ym, v in vars_.items() if v.get()} if result["ok"] else None
+    box.destroy()
+    win.withdraw()
+    return chosen
 
 
 def run_all(a, root: Path, paths, confirm=None) -> int:
